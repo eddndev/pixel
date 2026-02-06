@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use image::{GenericImageView, Pixel};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -22,12 +24,20 @@ enum Commands {
         /// Pixel block size
         #[arg(short, long, default_value_t = 10)]
         block_size: u32,
+
+        /// Optional path to output file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Map every single pixel of the image to its color ID
     Map {
         /// Path to the input image
         #[arg(short, long)]
         input: PathBuf,
+
+        /// Optional path to output file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -37,7 +47,7 @@ struct Output {
     colors: HashMap<u32, String>,
 }
 
-fn process_image(input_path: &PathBuf, block_size: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let img = image::open(input_path)?;
     let (width, height) = img.dimensions();
 
@@ -102,7 +112,15 @@ fn process_image(input_path: &PathBuf, block_size: u32) -> Result<(), Box<dyn st
         colors: id_to_color,
     };
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    let json_output = serde_json::to_string_pretty(&output)?;
+
+    if let Some(path) = output_path {
+        let mut file = File::create(path)?;
+        file.write_all(json_output.as_bytes())?;
+    } else {
+        println!("{}", json_output);
+    }
+
     Ok(())
 }
 
@@ -110,13 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Pixelate { input, block_size } => {
+        Commands::Pixelate { input, block_size, output } => {
             if *block_size == 0 {
                 eprintln!("Error: Block size must be greater than 0");
                 std::process::exit(1);
             }
-            process_image(input, *block_size)
+            process_image(input, *block_size, output.as_ref())
         }
-        Commands::Map { input } => process_image(input, 1),
+        Commands::Map { input, output } => process_image(input, 1, output.as_ref()),
     }
 }
