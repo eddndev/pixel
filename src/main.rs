@@ -28,6 +28,10 @@ enum Commands {
         /// Optional path to output file
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Color grouping tolerance (0.0 to ~510.0)
+        #[arg(short, long, default_value_t = 0.0)]
+        tolerance: f64,
     },
     /// Map every single pixel of the image to its color ID
     Map {
@@ -38,6 +42,10 @@ enum Commands {
         /// Optional path to output file
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Color grouping tolerance (0.0 to ~510.0)
+        #[arg(short, long, default_value_t = 0.0)]
+        tolerance: f64,
     },
     /// Reconstruct an image from a JSON output file
     Reconstruct {
@@ -57,13 +65,29 @@ struct Output {
     colors: HashMap<u32, String>,
 }
 
-fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn color_distance(c1: &Rgba<u8>, c2: &Rgba<u8>) -> f64 {
+    let r_diff = c1[0] as f64 - c2[0] as f64;
+    let g_diff = c1[1] as f64 - c2[1] as f64;
+    let b_diff = c1[2] as f64 - c2[2] as f64;
+    let a_diff = c1[3] as f64 - c2[3] as f64;
+    (r_diff * r_diff + g_diff * g_diff + b_diff * b_diff + a_diff * a_diff).sqrt()
+}
+
+fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&PathBuf>, tolerance: f64) -> Result<(), Box<dyn std::error::Error>> {
     let img = image::open(input_path)?;
     let (width, height) = img.dimensions();
 
     let mut matrix: Vec<Vec<u32>> = Vec::new();
     let mut color_to_id: HashMap<String, u32> = HashMap::new();
     let mut id_to_color: HashMap<u32, String> = HashMap::new();
+    // Cache of canonical colors for fuzzy matching: (ID, RGBA)
+    let mut palette: Vec<(u32, Rgba<u8>)> = Vec::new();
+
+    // Reserve ID 0 for fully transparent
+    let transparent_hex = "#00000000".to_string();
+    color_to_id.insert(transparent_hex.clone(), 0);
+    id_to_color.insert(0, transparent_hex);
+
     let mut next_id = 1;
 
     for y in (0..height).step_by(block_size as usize) {
@@ -124,14 +148,40 @@ fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&Pat
                 }
             }
 
+            let current_rgba = Rgba([r, g, b, a]);
             let hex_color = format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a);
 
-            let id = *color_to_id.entry(hex_color.clone()).or_insert_with(|| {
-                let id = next_id;
-                id_to_color.insert(id, hex_color);
-                next_id += 1;
-                id
-            });
+            // 1. Try exact match
+            let id = if let Some(&existing_id) = color_to_id.get(&hex_color) {
+                existing_id
+            } else {
+                // 2. Try fuzzy match (if tolerance > 0 and not transparent)
+                let mut found_id = None;
+                if tolerance > 0.0 && a > 0 {
+                    for (pid, p_color) in &palette {
+                        if color_distance(&current_rgba, p_color) <= tolerance {
+                            found_id = Some(*pid);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(fid) = found_id {
+                    // Map this specific slightly-different hex to the existing ID for future speed
+                    color_to_id.insert(hex_color.clone(), fid);
+                    fid
+                } else {
+                    // New color
+                    let id = next_id;
+                    if id != 0 { // Should always be true as we start at 1
+                         palette.push((id, current_rgba));
+                    }
+                    color_to_id.insert(hex_color.clone(), id);
+                    id_to_color.insert(id, hex_color);
+                    next_id += 1;
+                    id
+                }
+            };
 
             row.push(id);
         }
@@ -143,7 +193,22 @@ fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&Pat
         colors: id_to_color,
     };
 
-    let json_output = serde_json::to_string_pretty(&output)?;
+    // Custom JSON serialization to keep matrix rows on single lines
+    let mut json_output = String::new();
+    json_output.push_str("{\n  \"matrix\": [\n");
+    for (i, row) in output.matrix.iter().enumerate() {
+        let row_str = serde_json::to_string(row)?;
+        json_output.push_str("    ");
+        json_output.push_str(&row_str);
+        if i < output.matrix.len() - 1 {
+            json_output.push_str(",");
+        }
+        json_output.push_str("\n");
+    }
+    json_output.push_str("  ],\n  \"colors\": ");
+    let colors_json = serde_json::to_string_pretty(&output.colors)?;
+    json_output.push_str(&colors_json);
+    json_output.push_str("\n}");
 
     if let Some(path) = output_path {
         let mut file = File::create(path)?;
@@ -202,14 +267,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Pixelate { input, block_size, output } => {
+        Commands::Pixelate { input, block_size, output, tolerance } => {
             if *block_size == 0 {
                 eprintln!("Error: Block size must be greater than 0");
                 std::process::exit(1);
             }
-            process_image(input, *block_size, output.as_ref())
+            process_image(input, *block_size, output.as_ref(), *tolerance)
         }
-        Commands::Map { input, output } => process_image(input, 1, output.as_ref()),
+        Commands::Map { input, output, tolerance } => process_image(input, 1, output.as_ref(), *tolerance),
         Commands::Reconstruct { input, output } => reconstruct_image(input, output),
     }
 }
