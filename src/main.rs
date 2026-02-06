@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use image::{GenericImageView, Pixel};
-use serde::Serialize;
+use image::{GenericImageView, ImageBuffer, Pixel, Rgba, RgbaImage};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -39,9 +39,19 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Reconstruct an image from a JSON output file
+    Reconstruct {
+        /// Path to the input JSON file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Path to the output image
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Output {
     matrix: Vec<Vec<u32>>,
     colors: HashMap<u32, String>,
@@ -62,11 +72,13 @@ fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&Pat
             let r: u8;
             let g: u8;
             let b: u8;
+            let a: u8;
 
             if block_size > 1 {
                 let mut r_sum: u64 = 0;
                 let mut g_sum: u64 = 0;
                 let mut b_sum: u64 = 0;
+                let mut a_sum: u64 = 0;
                 let mut count: u64 = 0;
 
                 let x_end = (x + block_size).min(width);
@@ -75,25 +87,44 @@ fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&Pat
                 for by in y..y_end {
                     for bx in x..x_end {
                         let pixel = img.get_pixel(bx, by);
-                        let rgb = pixel.to_rgb();
-                        r_sum += rgb[0] as u64;
-                        g_sum += rgb[1] as u64;
-                        b_sum += rgb[2] as u64;
+                        let rgba = pixel.to_rgba();
+                        r_sum += rgba[0] as u64;
+                        g_sum += rgba[1] as u64;
+                        b_sum += rgba[2] as u64;
+                        a_sum += rgba[3] as u64;
                         count += 1;
                     }
                 }
-                r = (r_sum / count) as u8;
-                g = (g_sum / count) as u8;
-                b = (b_sum / count) as u8;
+                
+                let avg_a = (a_sum / count) as u8;
+                if avg_a == 0 {
+                    r = 0;
+                    g = 0;
+                    b = 0;
+                    a = 0;
+                } else {
+                    r = (r_sum / count) as u8;
+                    g = (g_sum / count) as u8;
+                    b = (b_sum / count) as u8;
+                    a = avg_a;
+                }
             } else {
                 let pixel = img.get_pixel(x, y);
-                let rgb = pixel.to_rgb();
-                r = rgb[0];
-                g = rgb[1];
-                b = rgb[2];
+                let rgba = pixel.to_rgba();
+                if rgba[3] == 0 {
+                    r = 0;
+                    g = 0;
+                    b = 0;
+                    a = 0;
+                } else {
+                    r = rgba[0];
+                    g = rgba[1];
+                    b = rgba[2];
+                    a = rgba[3];
+                }
             }
 
-            let hex_color = format!("#{:02x}{:02x}{:02x}", r, g, b);
+            let hex_color = format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a);
 
             let id = *color_to_id.entry(hex_color.clone()).or_insert_with(|| {
                 let id = next_id;
@@ -124,6 +155,49 @@ fn process_image(input_path: &PathBuf, block_size: u32, output_path: Option<&Pat
     Ok(())
 }
 
+fn hex_to_rgba(hex: &str) -> Result<Rgba<u8>, String> {
+    if hex.len() != 9 || !hex.starts_with('#') {
+        return Err(format!("Invalid hex color: {}", hex));
+    }
+    let r = u8::from_str_radix(&hex[1..3], 16).map_err(|e| e.to_string())?;
+    let g = u8::from_str_radix(&hex[3..5], 16).map_err(|e| e.to_string())?;
+    let b = u8::from_str_radix(&hex[5..7], 16).map_err(|e| e.to_string())?;
+    let a = u8::from_str_radix(&hex[7..9], 16).map_err(|e| e.to_string())?;
+    Ok(Rgba([r, g, b, a]))
+}
+
+fn reconstruct_image(input_path: &PathBuf, output_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::open(input_path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let data: Output = serde_json::from_str(&contents)?;
+
+    if data.matrix.is_empty() {
+        return Err("Matrix is empty".into());
+    }
+
+    let height = data.matrix.len() as u32;
+    let width = data.matrix[0].len() as u32;
+
+    let mut img: RgbaImage = ImageBuffer::new(width, height);
+
+    for (y, row) in data.matrix.iter().enumerate() {
+        for (x, &id) in row.iter().enumerate() {
+            if let Some(hex_color) = data.colors.get(&id) {
+                let rgba = hex_to_rgba(hex_color)?;
+                img.put_pixel(x as u32, y as u32, rgba);
+            } else {
+                eprintln!("Warning: Color ID {} not found in map", id);
+                img.put_pixel(x as u32, y as u32, Rgba([0, 0, 0, 0])); // Default to transparent
+            }
+        }
+    }
+
+    img.save(output_path)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -136,5 +210,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             process_image(input, *block_size, output.as_ref())
         }
         Commands::Map { input, output } => process_image(input, 1, output.as_ref()),
+        Commands::Reconstruct { input, output } => reconstruct_image(input, output),
     }
 }
